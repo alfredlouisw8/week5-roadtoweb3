@@ -14,15 +14,39 @@ import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
 // This import includes functions from both ./KeeperBase.sol and
 // ./interfaces/KeeperCompatibleInterface.sol
 import "@chainlink/contracts/src/v0.8/KeeperCompatible.sol";
+import "@chainlink/contracts/src/v0.8/interfaces/VRFCoordinatorV2Interface.sol";
+import "@chainlink/contracts/src/v0.8/VRFConsumerBaseV2.sol";
 
-// Dev imports. This only works on a local dev network
-// and will not work on any test or main livenets.
+// Dev imports
 import "hardhat/console.sol";
 
-contract BullBear is ERC721, ERC721Enumerable, ERC721URIStorage, Ownable {
+contract BullBear is
+    ERC721,
+    ERC721Enumerable,
+    ERC721URIStorage,
+    KeeperCompatibleInterface,
+    Ownable,
+    VRFConsumerBaseV2
+{
     using Counters for Counters.Counter;
+    enum Trend {
+        BULL,
+        BEAR
+    }
 
     Counters.Counter private _tokenIdCounter;
+    AggregatorV3Interface public pricefeed;
+    VRFCoordinatorV2Interface private immutable COORDINATOR;
+    uint64 private immutable s_subscriptionId;
+
+    /**
+     * Use an interval in seconds and a timestamp to slow execution of Upkeep
+     */
+    uint public immutable interval;
+    uint public lastTimeStamp;
+
+    int256 public currentPrice;
+    Trend public currentMarketTrend;
 
     // IPFS URIs for the dynamic nft graphics/metadata.
     // NOTE: These connect to my IPFS Companion node.
@@ -38,7 +62,31 @@ contract BullBear is ERC721, ERC721Enumerable, ERC721URIStorage, Ownable {
         "https://ipfs.io/ipfs/QmbKhBXVWmwrYsTPFYfroR2N7NAekAMxHUVg2CWks7i9qj?filename=simple_bear.json"
     ];
 
-    constructor() ERC721("Bull&Bear", "BBTK") {}
+    event TokensUpdated(Trend marketTrend);
+
+    // For testing with the mock on Rinkeby, pass in 10(seconds) for `updateInterval` and the address of my
+    // deployed  MockPriceFeed.sol contract (0xD753A1c190091368EaC67bbF3Ee5bAEd265aC420).
+    constructor(
+        uint updateInterval,
+        address _pricefeed,
+        address _coordinator,
+        uint64 _subscriptionId
+    ) ERC721("Bull&Bear", "BBTK") VRFConsumerBaseV2(_coordinator) {
+        // Set the keeper update interval
+        interval = updateInterval;
+        lastTimeStamp = block.timestamp; //  seconds since unix epoch
+
+        // set the price feed address to
+        // BTC/USD Price Feed Contract Address on Rinkeby: https://rinkeby.etherscan.io/address/0xECe365B379E1dD183B20fc5f022230C044d51404
+        // or the MockPriceFeed Contract
+        pricefeed = AggregatorV3Interface(_pricefeed); // To pass in the mock
+
+        COORDINATOR = VRFCoordinatorV2Interface(_coordinator);
+        s_subscriptionId = _subscriptionId;
+
+        // set the price for the chosen currency pair.
+        currentPrice = getLatestPrice();
+    }
 
     function safeMint(address to) public {
         // Current counter value will be the minted token's token ID.
@@ -60,6 +108,113 @@ contract BullBear is ERC721, ERC721Enumerable, ERC721URIStorage, Ownable {
             " and assigned token url: ",
             defaultUri
         );
+    }
+
+    function checkUpkeep(
+        bytes calldata /* checkData */
+    )
+        external
+        view
+        override
+        returns (
+            bool upkeepNeeded,
+            bytes memory /*performData */
+        )
+    {
+        upkeepNeeded = (block.timestamp - lastTimeStamp) > interval;
+    }
+
+    function performUpkeep(
+        bytes calldata /* performData */
+    ) external override {
+        //We highly recommend revalidating the upkeep in the performUpkeep function
+        if ((block.timestamp - lastTimeStamp) > interval) {
+            lastTimeStamp = block.timestamp;
+            int latestPrice = getLatestPrice();
+
+            if (latestPrice == currentPrice) {
+                console.log("NO CHANGE -> returning!");
+                return;
+            }
+
+            if (latestPrice < currentPrice) {
+                // bear
+                console.log("ITS BEAR TIME");
+                currentMarketTrend = Trend.BEAR;
+            } else {
+                // bull
+                console.log("ITS BULL TIME");
+                currentMarketTrend = Trend.BULL;
+            }
+
+            // update currentPrice
+            currentPrice = latestPrice;
+
+            console.log("subscription id = ", s_subscriptionId);
+
+            uint256 requestId = COORDINATOR.requestRandomWords(
+                0x79d3d8832d904592c0bf9818b621522c988bb8b0c05cdc3b15aea1b6e8db0c15,
+                s_subscriptionId,
+                3,
+                500000,
+                1
+            );
+
+            console.log("request id = ", requestId);
+        } else {
+            console.log(" INTERVAL NOT UP!");
+            return;
+        }
+    }
+
+    // Helpers
+    function getLatestPrice() public view returns (int256) {
+        (
+            ,
+            /*uint80 roundID*/
+            int price, /*uint startedAt*/ /*uint timeStamp*/ /*uint80 answeredInRound*/
+            ,
+            ,
+
+        ) = pricefeed.latestRoundData();
+
+        return price; //  example price returned 3034715771688
+    }
+
+    function fulfillRandomWords(
+        uint256 _requestId,
+        uint256[] memory _randomWords
+    ) internal override {
+        uint256 randomIndex = _randomWords[0] % bullUrisIpfs.length;
+        if (currentMarketTrend == Trend.BEAR) {
+            console.log("ITS BEAR TIME");
+            for (uint i = 0; i < _tokenIdCounter.current(); i++) {
+                _setTokenURI(i, bearUrisIpfs[randomIndex]);
+            }
+        } else {
+            console.log("ITS BULL TIME");
+            for (uint i = 0; i < _tokenIdCounter.current(); i++) {
+                _setTokenURI(i, bullUrisIpfs[randomIndex]);
+            }
+        }
+        emit TokensUpdated(currentMarketTrend);
+    }
+
+    function setPriceFeed(address newFeed) public onlyOwner {
+        pricefeed = AggregatorV3Interface(newFeed);
+    }
+
+    function setInterval(uint256 newInterval) public onlyOwner {
+        interval = newInterval;
+    }
+
+    function compareStrings(string memory a, string memory b)
+        internal
+        pure
+        returns (bool)
+    {
+        return (keccak256(abi.encodePacked((a))) ==
+            keccak256(abi.encodePacked((b))));
     }
 
     // The following functions are overrides required by Solidity.
